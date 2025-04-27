@@ -1,103 +1,152 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import zipfile
 from typing import List
 import pandas as pd
 import io
 import os
-import uuid
+import logging
+from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
-# Directory to save processed files
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Constants
 OUTPUT_DIR = "processed"
+REQUIRED_COLUMNS = [
+    "Case ID", "Mother name", "User name", "User Phone", "User Role",
+    "Child ID", "Child Name", "Child DOB", "Child Weight Zscore",
+    "Last Weight Zscore", "Mother Location", "User Block/Project/Tehsil",
+    "User Facility/Center"
+]
 
 # Ensure output directory exists
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def format_excel_worksheet(ws):
+    """Format Excel worksheet with table and column widths"""
+    try:
+        table = Table(displayName=f"Table_{ws.title}", ref=ws.dimensions)
+        style = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False
+        )
+        table.tableStyleInfo = style
+        ws.add_table(table)
+
+        for col_idx, col in enumerate(ws.columns, 1):
+            max_length = max((len(str(cell.value)) for cell in col if cell.value), default=0)
+            ws.column_dimensions[get_column_letter(col_idx)].width = max_length + 2
+    except Exception as e:
+        logger.error(f"Error formatting worksheet {ws.title}: {str(e)}")
+        raise
+
+def process_dataframe(df: pd.DataFrame) -> tuple:
+    """Process dataframe and return segregated data"""
+    zscore_column = 'Last Weight Zscore'
+    return (
+        df[df[zscore_column] <= -3],  # SUW
+        df[(df[zscore_column] > -3) & (df[zscore_column] <= -2)],  # MUW
+        df[(df[zscore_column] > -2) & (df[zscore_column] <= -1)]   # Mild
+    )
 
 @app.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
-    processed_files = []  # List to store paths of processed files
+    try:
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided")
 
-    # Loop through each file
-    for file in files:
-        original_filename = file.filename
-        processed_filename = f"processed_{uuid.uuid4().hex}_{original_filename}"
+        processed_files = []
 
-        # Read the CSV file content
-        contents = await file.read()
+        for file in files:
+            logger.info(f"Processing file: {file.filename}")
+            
+            # Create processed filename using original name
+            processed_filename = f"processed_{file.filename}"
+            
+            # Read and validate CSV
+            contents = await file.read()
+            try:
+                df = pd.read_csv(io.BytesIO(contents), low_memory=False, on_bad_lines='skip')
+                logger.info(f"Original rows in {file.filename}: {len(df)}")
+                
+                # Validate required columns
+                missing_columns = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+                if missing_columns:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Missing columns in {file.filename}: {missing_columns}"
+                    )
 
-        try:
-            # Attempt to read the CSV file and skip problematic lines
-            df = pd.read_csv(io.BytesIO(contents), low_memory=False, on_bad_lines='skip')
-        except Exception as e:
-            # Return a detailed error message if the file cannot be processed
-            return JSONResponse(status_code=400, content={"error": f"Error reading file {original_filename}: {e}"})
+                # Filter and process data
+                df = df[REQUIRED_COLUMNS]
+                df_suw, df_muw, df_mild = process_dataframe(df)
+
+                # Create Excel file
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    for name, data in [("SUW", df_suw), ("MUW", df_muw), ("Mild", df_mild)]:
+                        data.to_excel(writer, sheet_name=name, index=False)
+                        
+                output.seek(0)
+                wb = load_workbook(filename=output)
+                
+                # Format each worksheet
+                for sheet_name in wb.sheetnames:
+                    format_excel_worksheet(wb[sheet_name])
+
+                # Save processed file
+                output_path = os.path.join(OUTPUT_DIR, processed_filename)
+                wb.save(output_path)
+                
+                processed_files.append(output_path)
+                logger.info(f"Successfully processed {file.filename}")
+
+            except Exception as e:
+                logger.error(f"Error processing {file.filename}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Error processing {file.filename}: {str(e)}")
+
+        # Create a zip of all processed files
+        if processed_files:
+            zip_filename = f"processed_files_{datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
+            zip_filepath = os.path.join(OUTPUT_DIR, zip_filename)
+            
+            with zipfile.ZipFile(zip_filepath, 'w') as zipf:
+                for file in processed_files:
+                    zipf.write(file, os.path.basename(file))
+
+            return FileResponse(
+                zip_filepath,
+                media_type="application/zip",
+                filename=zip_filename
+            )
         
-        # Check the number of rows before filtering
-        print(f"Total rows in the original data for {original_filename}: {len(df)}")
+        raise HTTPException(status_code=500, detail="No files were processed successfully")
 
-        # Filter required columns
-        columns_to_extract = [
-            "Case ID", "Mother name", "User name", "User Phone", "User Role",
-            "Child ID", "Child Name", "Child DOB", "Child Weight Zscore",
-            "Last Weight Zscore", "Mother Location", "User Block/Project/Tehsil",
-            "User Facility/Center"
-        ]
-        
-        # Check if all the required columns are present
-        missing_columns = [col for col in columns_to_extract if col not in df.columns]
-        if missing_columns:
-            return JSONResponse(status_code=400, content={"error": f"Missing columns in {original_filename}: {missing_columns}"})
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-        df = df[columns_to_extract]
-
-        # Segregate based on z-score
-        zscore_column = 'Last Weight Zscore'
-        df_suw = df[df[zscore_column] <= -3]
-        df_muw = df[(df[zscore_column] > -3) & (df[zscore_column] <= -2)]
-        df_mild = df[(df[zscore_column] > -2) & (df[zscore_column] <= -1)]
-
-        # Save into an in-memory Excel file
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_suw.to_excel(writer, sheet_name="SUW", index=False)
-            df_muw.to_excel(writer, sheet_name="MUW", index=False)
-            df_mild.to_excel(writer, sheet_name="Mild", index=False)
-
-        output.seek(0)
-
-        # Load workbook for formatting
-        wb = load_workbook(filename=output)
-        for sheet_name in ["SUW", "MUW", "Mild"]:
-            ws = wb[sheet_name]
-
-            table = Table(displayName=f"Table_{sheet_name}", ref=ws.dimensions)
-            style = TableStyleInfo(name="TableStyleLight1", showFirstColumn=False,
-                                   showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-            table.tableStyleInfo = style
-            ws.add_table(table)
-
-            for col_idx, col in enumerate(ws.columns, 1):
-                max_length = max((len(str(cell.value)) for cell in col if cell.value), default=0)
-                adjusted_width = max_length + 2
-                ws.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
-
-        # Save the final file to an in-memory byte buffer again
-        final_output = io.BytesIO()
-        wb.save(final_output)
-        final_output.seek(0)
-
-        # Save the file to the 'processed' folder
-        output_path = os.path.join(OUTPUT_DIR, processed_filename)
-        with open(output_path, "wb") as f:
-            f.write(final_output.getbuffer())
-
-        # Add the path to the processed file to the list
-        processed_files.append(output_path)
-
-    # Return the list of processed file paths
-    return {"processed_files": processed_files}
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
